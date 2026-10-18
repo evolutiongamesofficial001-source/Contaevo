@@ -203,7 +203,7 @@ const ic=(n,s=20)=>`<svg class="ic" width="${s}" height="${s}" viewBox="0 0 24 2
 /* ============ UTIL ============ */
 const $=(s,r=document)=>r.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const key=s=>s.replace(/[.#$\[\]\/%]/g,c=>'%'+c.charCodeAt(0).toString(16).padStart(2,'0'));
+const key=s=>s.replace(/[^a-zA-Z0-9_-]/g,c=>'~'+c.charCodeAt(0).toString(16)+'~'); /* chave segura p/ Firebase e URL */
 const isId=s=>/^EV-\d{8}$/.test(s);
 const cid=(a,b)=>[a,b].sort().join('_');
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -251,31 +251,41 @@ let primary=0;
 async function req(base,path,method,body){
  const c=new AbortController(),t=setTimeout(()=>c.abort(),TIMEOUT);
  try{
-  const r=await fetch(base+'/'+path+'.json',{method,body:body===undefined?undefined:JSON.stringify(body),signal:c.signal});
-  if(!r.ok)throw new Error('HTTP '+r.status);
+  let r;
+  try{r=await fetch(base+'/'+path+'.json',{method,body:body===undefined?undefined:JSON.stringify(body),signal:c.signal})}
+  catch(e){const er=new Error(e.name==='AbortError'?'tempo esgotado':'falha de rede/bloqueio');er.status=0;throw er}
+  if(!r.ok){const er=new Error('HTTP '+r.status);er.status=r.status;throw er}
   return await r.json();
  }finally{clearTimeout(t)}
+}
+function explain(errs){
+ const st=errs.map(e=>e&&e.status||0);
+ if(st.every(x=>x===401||x===403))return'Os bancos Firebase recusaram o acesso (HTTP '+st[0]+'). Em cada Realtime Database abra a aba "Regras" e publique: {"rules":{".read":true,".write":true}}';
+ if(st.every(x=>x===404))return'Os bancos Firebase não foram encontrados (HTTP 404). Confira se os Realtime Databases existem e estão ativos.';
+ if(st.every(x=>x===0))return'Sem conexão com os servidores Evo (falha de rede, bloqueio de anúncios/VPN ou tempo esgotado). Toque em "Testar servidores" para ver detalhes.';
+ return'Sem conexão com os servidores Evo. Detalhes: '+[...new Set(st.map(x=>x||'rede'))].join(', ')+'. Toque em "Testar servidores".';
 }
 const NOCONN='Sem conexão com os servidores Evo. Tente novamente.';
 async function dbGet(path,any){
  if(any){
   const rs=await Promise.allSettled(DBS.map(b=>req(b,path,'GET')));
   const ok=rs.filter(r=>r.status==='fulfilled');
-  if(!ok.length)throw new Error(NOCONN);
+  if(!ok.length)throw new Error(explain(rs.map(r=>r.reason)));
   const f=ok.find(r=>r.value!==null);return f?f.value:null;
  }
+ const errs=[];
  for(let k=0;k<DBS.length;k++){const i=(k+primary)%DBS.length;
-  try{const v=await req(DBS[i],path,'GET');primary=i;return v}catch(e){}}
- throw new Error(NOCONN);
+  try{const v=await req(DBS[i],path,'GET');primary=i;return v}catch(e){errs.push(e)}}
+ throw new Error(explain(errs));
 }
 function dbWrite(path,method,body){ /* grava nos 5; conclui quando o primeiro confirmar */
- return new Promise((res,rej)=>{let fails=0;
-  DBS.forEach((b,i)=>req(b,path,method,body).then(()=>{primary=i;res()}).catch(()=>{if(++fails===DBS.length)rej(new Error(NOCONN))}))});
+ return new Promise((res,rej)=>{const errs=[];
+  DBS.forEach((b,i)=>req(b,path,method,body).then(()=>{primary=i;res()}).catch(e=>{errs.push(e);if(errs.length===DBS.length)rej(new Error(explain(errs)))}))});
 }
 const dbSet=(p,v)=>dbWrite(p,'PUT',v),dbPatch=(p,v)=>dbWrite(p,'PATCH',v),dbDel=p=>dbWrite(p,'DELETE');
 const dbDelAll=p=>Promise.allSettled(DBS.map(b=>req(b,p,'DELETE'))); /* espera todos */
 async function pingAll(){
- S.servers=await Promise.all(DBS.map(async b=>{const t=performance.now();try{await req(b,'meta/chatReset','GET');return{ok:true,ms:Math.round(performance.now()-t)}}catch(e){return{ok:false,ms:0}}}));
+ S.servers=await Promise.all(DBS.map(async b=>{const t=performance.now();try{await req(b,'meta/chatReset','GET');return{ok:true,ms:Math.round(performance.now()-t)}}catch(e){return{ok:false,ms:0,err:e.status?'HTTP '+e.status+(e.status===401||e.status===403?' (regras bloqueando)':e.status===404?' (banco não encontrado)':''):e.message}}}));
  return S.servers;
 }
 
@@ -355,7 +365,7 @@ function renderAuth(mode='login'){
  $('#app').innerHTML=`<div class="auth"><div class="acard">
   <div class="brand center"><span class="logo">${ic('bolt',26)}</span><h1>Evo<span>Account</span></h1><p class="muted" style="margin:0">Sua conta única no ecossistema Evo.</p></div>
   <div class="seg tabs"><button class="${mode==='login'?'on':''}" onclick="renderAuth('login')">Entrar</button><button class="${mode==='register'?'on':''}" onclick="renderAuth('register')">Criar conta</button></div>
-  ${mode==='login'?login:reg}</div></div>`;
+  ${mode==='login'?login:reg}<p class="center" style="margin:14px 0 0"><button type="button" class="eye" style="position:static;transform:none" onclick="openServers()">Testar servidores</button></p></div></div>`;
 }
 function togglePw(b){const i=b.previousElementSibling;const show=i.type==='password';i.type=show?'text':'password';b.textContent=show?'Ocultar':'Mostrar'}
 
@@ -373,7 +383,7 @@ async function submitLogin(e){
 }
 
 /* loader de criação de conta */
-const STEPS=['Conectando aos servidores evolution','Escrevendo sua segurança','Criando seu Evo id'];
+const STEPS=['Criando seu Evo id'];
 function showLoader(){
  $('#ldlogo').innerHTML=ic('bolt',34);
  $('#steps').innerHTML=STEPS.map((t,i)=>`<li id="st${i}"><span class="sp"></span><em style="font-style:normal">${t}</em></li>`).join('');
@@ -382,7 +392,7 @@ function showLoader(){
 const hideLoader=()=>$('#loader').classList.add('hidden');
 async function runStep(i,fn){
  $('#st'+i).className='act';
- await Promise.all([fn(),sleep(1000)]);
+ await Promise.all([fn(),sleep(1800)]);
  $('#st'+i).className='done';$('#pb').style.width=((i+1)/STEPS.length*100)+'%';
 }
 async function submitRegister(e){
@@ -399,9 +409,7 @@ async function submitRegister(e){
    const [a,b]=await Promise.all([dbGet('idx/u/'+key(u.toLowerCase()),true),dbGet('idx/e/'+key(em),true)]);
    if(a)throw new Error('Esse nome de usuário já está em uso.');
    if(b)throw new Error('Esse e-mail já está cadastrado.');
-  });
-  await runStep(1,async()=>{salt=rnd(16);hash=await sha256(salt+':'+p)});
-  await runStep(2,async()=>{
+   salt=rnd(16);hash=await sha256(salt+':'+p);
    do{id=genEvoId()}while(await dbGet('profiles/'+id,true));
    await Promise.all([
     dbSet('profiles/'+id,{username:u,photo:'',bio:'',allowRequests:true,created:now}),
@@ -757,7 +765,7 @@ function openChangePw(){
 async function openServers(){
  openModal('<h2>Servidores Evo</h2><p class="muted">Testando conexão…</p>');
  const r=await pingAll();
- openModal(`<h2>Servidores Evo</h2><p class="muted">${r.filter(x=>x.ok).length} de ${DBS.length} online</p>${r.map((x,i)=>`<div class="row"><span class="ri" style="color:${x.ok?'var(--ok)':'var(--danger)'}">${ic(x.ok?'check':'x')}</span><div class="grow"><b>Evo Server ${i+1}</b><small>${x.ok?x.ms+' ms':'Offline'}</small></div></div>`).join('')}<div class="mrow"><button class="btn" onclick="closeModal()">Fechar</button></div>`);
+ openModal(`<h2>Servidores Evo</h2><p class="muted">${r.filter(x=>x.ok).length} de ${DBS.length} online</p>${r.map((x,i)=>`<div class="row"><span class="ri" style="color:${x.ok?'var(--ok)':'var(--danger)'}">${ic(x.ok?'check':'x')}</span><div class="grow"><b>Evo Server ${i+1}</b><small>${x.ok?x.ms+' ms':'Offline — '+esc(x.err||'')}</small></div></div>`).join('')}<div class="mrow"><button class="btn" onclick="closeModal()">Fechar</button></div>`);
 }
 function exportData(){
  const d={evoId:ME.id,username:ME.username,email:ME.email,bio:ME.bio,created:ME.created,settings:ME.settings,extensions:ME.extensions,friends:S.friends.map(f=>f.id),exportedAt:new Date().toISOString()};
